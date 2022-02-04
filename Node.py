@@ -14,6 +14,10 @@ def pluse(d,v,s):
         d[v] = s
     else:
         d[v] +=s
+def hash_tx(tx):
+    data = tx["input"] + " " + tx["output"] + " " + tx["amount"] + " " + tx[
+        "fee"]
+    return hashlib.sha256(data.encode()).hexdigest()
 def hash_block(b):
 
     """
@@ -22,7 +26,8 @@ def hash_block(b):
     """
 
     d = b["prev_hash"]+" "+b["nonce"]+" "+b['difficulty']+" "+b["miner"]
-
+    for tx in b["transactions"]:
+        d+=hash_tx(tx)
     return int(hashlib.sha256(d.encode()).hexdigest(),base=16)
 
 class Miner:
@@ -72,10 +77,7 @@ class Miner:
         requests.post(choicenode+"/addblock",data={'data':json.dumps(b)})
 
         return b
-def hash_tx(tx):
-    data = tx["input"] + " " + tx["output"] + " " + tx["amount"] + " " + tx[
-        "fee"]
-    return hashlib.sha256(data.encode()).hexdigest()
+
 class Blockchain:
     def __init__(self):
         self.maxh = 2**256
@@ -85,6 +87,7 @@ class Blockchain:
         self.wallets = {}
         self.nodes = ["http://localhost:7070"]
         self.transaction_hashes = {}
+        self.mempool_hashes = set()
         self.mempool = []
     def request_add_block(self,block):
         bhash= hash_block(block)
@@ -111,36 +114,46 @@ class Blockchain:
         miner = block["miner"]
         changes = {miner:0}
         new_tx = []
+        transaction_hash_changes= {}
         for transaction in transactions:
             if get(self.wallets,transaction['input']) <\
                     int(transaction['amount']):
 
                 print("not enough")
                 continue
+            if int(transaction["amount"]) <= 0:
+                raise Exception("illegal amount")
+            if int(transaction["fee"]) <= 0:
+                raise Exception("illegal fee")
             data = transaction["input"]+" "+transaction["output"]+" "+transaction["amount"]+" "+transaction["fee"]
             vk = ecdsa.VerifyingKey.from_string(base64.b64decode(transaction["input"]), curve=ecdsa.SECP256k1, hashfunc=hashlib.sha256)
             try:
 
                 vk.verify(base64.b64decode(transaction["signature"]),data.encode(), hashfunc=hashlib.sha256)
             except:
-                print("failed to verify")
-                continue
+                raise Exception("failed to verify")
+
             hashed = hashlib.sha256(data.encode()).hexdigest()
             if  hashed in self.transaction_hashes:
-                print("double transaction")
-                continue
+                raise Exception("double transaction")
+
             new_tx.append(transaction)
-            pluse(self.transaction_hashes, transaction["input"], 1)
             pluse(changes,transaction["output"],int(transaction["amount"]))
             pluse(changes,transaction["input"],-int(transaction["amount"])-int(transaction["fee"]))
             changes[miner]+=int(transaction["fee"])
-            self.transaction_hashes[hashed] = len(self.blocks)
+            transaction_hash_changes[hashed] = len(self.blocks)
         for wallet in changes:
             pluse(self.wallets,wallet,changes[wallet])
+        for txh in transaction_hash_changes:
+            self.transaction_hashes[txh] = transaction_hash_changes[txh]
         block["transactions"]= new_tx
         return False
     def validate_transaction(self,tx):
         data = tx["input"]+" "+tx["output"]+" "+tx["amount"]+" "+tx["fee"]
+        if int(tx["amount"])<=0:
+            return False
+        if int(tx["fee"])<=0:
+            return False
         vk = ecdsa.VerifyingKey.from_string(base64.b64decode(tx["input"]), curve=ecdsa.SECP256k1, hashfunc=hashlib.sha256)
         try:
             vk.verify(base64.b64decode(tx["signature"]), data.encode(), hashfunc=hashlib.sha256)
@@ -166,8 +179,7 @@ class Blockchain:
 
             while i<max_l:
                 raw = requests.get(max_node+f"/feblock?feblock={i}").content
-                #     UNFINISHED
-                print(raw)
+
                 block = json.loads(raw)
                 transactions = block.pop("transactions")
                 block["transactions"] = []
@@ -188,7 +200,6 @@ class Blockchain:
                     print("INVALID")
                     return
 
-                print(i)
                 if i>max_l-len(self.blocks)-1 and int(block["prev_hash"])==hash_block(self.blocks[max_l-i-1]):
                     break
                 prev_hash = block["prev_hash"]
@@ -196,18 +207,23 @@ class Blockchain:
             for txh in transaction_hashes_changes:
                 if txh in self.transaction_hashes and self.transaction_hashes[txh]< max_l-i:
                     return
-            print(block_downloads[::-1])
             stop = i
-            print(list(enumerate(range(max_l-stop,max_l))))
             for c,i in enumerate(range(max_l-stop,max_l)):
 
                 if i< len(self.blocks):
-                    self.blocks[i] =block_downloads[-c-1]
+                    for tx in self.blocks[i]["transactions"]:
+                        hashed = hash_tx(tx)
+                        self.transaction_hashes.pop(hashed)
+                        self.mempool_hashes.add(hashed)
+
+                        self.blocks[i] =block_downloads[-c - 1]
                 else:
                     self.blocks.append(block_downloads[-c-1])
-
-
-
+            for tx in transaction_hashes_changes:
+                self.transaction_hashes[tx]=transaction_hashes_changes[tx]
+                hashed = hash_tx(tx)
+                if hashed in self.mempool_hashes:
+                    self.mempool_hashes.remove(hashed)
     # def
 bc = Blockchain()
 app = Flask(__name__)
@@ -239,6 +255,14 @@ def addblock():
     print("wallets:",bc.wallets)
     return jsonify({}),200
 @app.route("/addtx",methods=['POST'])
+def addtx():
+    tx = json.loads(dict(request.form)["data"])
+    if int(tx["fee"])<3:
+        return "too small of a fee, cheapskate",404
+    hashed = hash_tx(tx)
+    if hashed in bc.mempool:
+        return "no repeats, idiot",405
+    bc.mempool[hashed] = tx
 if __name__ == "__main__":
 
     app.run("localhost",int(input()))
